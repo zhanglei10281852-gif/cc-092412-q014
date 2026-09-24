@@ -1,0 +1,52 @@
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from app.api import audit, auth, departments_admin, maintenance, metrics, roles, system, users, workflow
+from app.core.errors import DomainError
+from app.database import close_connection, init_db
+from app.routers import affairs, announcements, departments, petitions, residents
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    del app
+    init_db()
+    yield
+    close_connection()
+
+
+app = FastAPI(title="乡镇政务协同服务", version="2.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(DomainError)
+async def handle_domain_error(request: Request, exc: DomainError) -> JSONResponse:
+    del request
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": {"code": exc.code, "message": exc.message, "context": exc.context}},
+    )
+
+
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(roles.router)
+app.include_router(audit.router)
+app.include_router(system.router)
+app.include_router(departments_admin.router)
+app.include_router(workflow.router)
+app.include_router(metrics.router)
+app.include_router(maintenance.router)
+app.include_router(residents.router)
+app.include_router(affairs.router)
+app.include_router(announcements.router)
+app.include_router(departments.router)
+app.include_router(petitions.router)
+
+
+@app.get("/")
+def root() -> dict:
+    return {"service": "乡镇政务协同服务", "version": "2.0.0"}
