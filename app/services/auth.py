@@ -55,28 +55,32 @@ class AuthService:
             raise AuthenticationError("用户名或密码错误")
         locked_until = from_storage(user.get("locked_until"))
         if locked_until and locked_until > now:
-            raise AccountLockedError("账号暂时锁定")
+            self._deny(AccountLockedError("账号暂时锁定"), user, {"lock_active": True, "client_label": client_label})
         if user["status"] == "disabled":
-            raise AuthenticationError("账号已停用")
+            self._deny(AuthenticationError("账号已停用"), user, {"disabled": True, "client_label": client_label})
         if not verify_password(password, user["password_hash"]):
             failures = int(user["failed_login_count"]) + 1
             lock_at = None
             status = user["status"]
+            locked_now = False
             if failures >= self.failure_limit:
                 lock_at = to_storage(now + timedelta(minutes=self.lock_minutes))
                 status = "locked"
+                locked_now = True
             self.connection.execute(
                 "UPDATE users SET failed_login_count=?,locked_until=?,status=?,updated_at=? WHERE id=?",
                 (failures, lock_at, status, to_storage(now), user["id"]),
             )
-            self.audit.record(
-                AuditContext(user["id"], user["display_name"]),
-                action="auth.login",
-                resource_type="session",
-                outcome="denied",
-                metadata={"failure_count": failures, "client_label": client_label},
+            self._deny(
+                AuthenticationError("用户名或密码错误"),
+                user,
+                {
+                    "failure_count": failures,
+                    "locked": locked_now,
+                    "locked_until": lock_at,
+                    "client_label": client_label,
+                },
             )
-            raise AuthenticationError("用户名或密码错误")
         token = generate_token()
         expires_at = now + timedelta(minutes=self.session_minutes)
         cursor = self.connection.execute(
@@ -84,18 +88,45 @@ class AuthService:
             "VALUES(?,?,?,?,?,?)",
             (user["id"], token_digest(token), to_storage(now), to_storage(expires_at), to_storage(now), client_label),
         )
+        session_id = int(cursor.lastrowid)
         self.connection.execute(
             "UPDATE users SET failed_login_count=0,locked_until=NULL,status='active',updated_at=? WHERE id=?",
             (to_storage(now), user["id"]),
         )
+        unlock_request = self.connection.execute(
+            "SELECT id FROM unlock_requests WHERE target_user_id=? AND status='approved' "
+            "AND first_login_at IS NULL ORDER BY id DESC LIMIT 1",
+            (user["id"],),
+        ).fetchone()
+        login_metadata = {"client_label": client_label}
+        if unlock_request is not None:
+            unlock_request_id = int(unlock_request["id"])
+            updated = self.connection.execute(
+                "UPDATE unlock_requests SET first_login_at=?,first_login_session_id=? "
+                "WHERE id=? AND first_login_at IS NULL",
+                (to_storage(now), session_id, unlock_request_id),
+            )
+            if updated.rowcount:
+                login_metadata["unlock_request_id"] = unlock_request_id
         self.audit.record(
             AuditContext(user["id"], user["display_name"]),
             action="auth.login",
             resource_type="session",
-            resource_id=cursor.lastrowid,
-            metadata={"client_label": client_label},
+            resource_id=session_id,
+            metadata=login_metadata,
         )
         return token, {"expires_at": to_storage(expires_at), "user": user, "permissions": sorted(self.users.permissions(user["id"]))}
+
+    def _deny(self, error: AuthenticationError, user: dict, metadata: dict) -> None:
+        """记录一次被拒绝的登录尝试，然后抛出给定异常（由路由提交后再向客户端返回）。"""
+        self.audit.record(
+            AuditContext(user["id"], user["display_name"]),
+            action="auth.login",
+            resource_type="session",
+            outcome="denied",
+            metadata=metadata,
+        )
+        raise error
 
     def principal(self, token: str) -> Principal:
         session = self.sessions.active_by_digest(token_digest(token))

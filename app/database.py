@@ -215,6 +215,53 @@ CREATE TABLE IF NOT EXISTS background_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON background_jobs(status, available_at);
+
+CREATE TABLE IF NOT EXISTS unlock_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_user_id INTEGER NOT NULL REFERENCES users(id),
+    applicant_user_id INTEGER NOT NULL REFERENCES users(id),
+    reason TEXT NOT NULL,
+    session_scope TEXT NOT NULL CHECK(session_scope IN ('all','current')),
+    target_session_id INTEGER REFERENCES sessions(id),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','withdrawn','expired','terminated')),
+    locked_snapshot TEXT NOT NULL,
+    requires_second INTEGER NOT NULL DEFAULT 0 CHECK(requires_second IN (0,1)),
+    first_approver_user_id INTEGER REFERENCES users(id),
+    first_approved_at TEXT,
+    second_approver_user_id INTEGER REFERENCES users(id),
+    second_approved_at TEXT,
+    decided_by_user_id INTEGER REFERENCES users(id),
+    decided_at TEXT,
+    decision_reason TEXT,
+    first_login_at TEXT,
+    first_login_session_id INTEGER REFERENCES sessions(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unlock_pending_target
+    ON unlock_requests(target_user_id) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_unlock_target ON unlock_requests(target_user_id, id);
+
+CREATE TABLE IF NOT EXISTS unlock_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES unlock_requests(id) ON DELETE CASCADE,
+    step INTEGER NOT NULL CHECK(step IN (1,2)),
+    approver_user_id INTEGER NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('approved','rejected')),
+    comment TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, step)
+);
+
+CREATE TABLE IF NOT EXISTS unlock_session_revocations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES unlock_requests(id) ON DELETE CASCADE,
+    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    revoked_at TEXT NOT NULL,
+    UNIQUE(request_id, session_id)
+);
 '''
 
 PERMISSIONS = [
@@ -233,6 +280,8 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("unlocks.read", "查看解锁申请", "unlocks", "read"),
+    ("unlocks.approve", "审批紧急解锁", "unlocks", "approve"),
 ]
 
 
@@ -302,10 +351,20 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES('auditor','审计查看员','只读查看业务与审计记录',1,?,?)",
             (now, now),
         )
+        connection.execute(
+            "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES('security_admin','安全管理员','审批紧急解锁申请',1,?,?)",
+            (now, now),
+        )
         administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
         connection.execute(
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) "
+            "SELECT r.id,p.id,? FROM roles r CROSS JOIN permissions p "
+            "WHERE r.code='security_admin' AND p.code IN ('unlocks.read','unlocks.approve')",
+            (now,),
         )
 
 
