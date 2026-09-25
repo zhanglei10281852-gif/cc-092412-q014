@@ -215,6 +215,43 @@ CREATE TABLE IF NOT EXISTS background_jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_ready ON background_jobs(status, available_at);
+
+CREATE TABLE IF NOT EXISTS unlock_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_user_id INTEGER NOT NULL REFERENCES users(id),
+    applicant_user_id INTEGER NOT NULL REFERENCES users(id),
+    reason TEXT NOT NULL,
+    session_scope TEXT NOT NULL CHECK(session_scope IN ('all','pre_lock','none')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','withdrawn','expired','terminated')),
+    requires_second INTEGER NOT NULL DEFAULT 0 CHECK(requires_second IN (0,1)),
+    target_locked_until TEXT NOT NULL,
+    target_failed_count INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by INTEGER REFERENCES users(id),
+    decision_note TEXT,
+    executed_at TEXT,
+    revoked_session_count INTEGER,
+    first_login_at TEXT,
+    first_login_session_id INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_unlock_pending_target ON unlock_requests(target_user_id) WHERE status='pending';
+CREATE INDEX IF NOT EXISTS idx_unlock_status ON unlock_requests(status);
+
+CREATE TABLE IF NOT EXISTS unlock_request_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES unlock_requests(id) ON DELETE CASCADE,
+    approver_user_id INTEGER NOT NULL REFERENCES users(id),
+    step INTEGER NOT NULL CHECK(step IN (1,2)),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(request_id, step),
+    UNIQUE(request_id, approver_user_id)
+);
 '''
 
 PERMISSIONS = [
@@ -233,6 +270,9 @@ PERMISSIONS = [
     ("announcements.write", "维护公告", "announcements", "write"),
     ("audit.read", "查看审计", "audit", "read"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
+    ("unlock.request", "提交解锁申请", "unlock", "request"),
+    ("unlock.approve", "审批解锁申请", "unlock", "approve"),
+    ("unlock.read", "查看解锁申请", "unlock", "read"),
 ]
 
 
@@ -269,11 +309,14 @@ def close_connection() -> None:
 
 
 @contextmanager
-def transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+def transaction(*, immediate: bool = False, commit_on_error: tuple[type[Exception], ...] = ()) -> Iterator[sqlite3.Connection]:
     connection = get_connection()
     connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
     try:
         yield connection
+    except commit_on_error:
+        connection.commit()
+        raise
     except Exception:
         connection.rollback()
         raise
@@ -302,10 +345,32 @@ def init_db() -> None:
             "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES('auditor','审计查看员','只读查看业务与审计记录',1,?,?)",
             (now, now),
         )
+        connection.execute(
+            "INSERT OR IGNORE INTO roles(code,name,description,is_system,created_at,updated_at) VALUES('security_officer','安全管理员','审批账号解锁申请并查看解锁记录',1,?,?)",
+            (now, now),
+        )
         administrator = connection.execute("SELECT id FROM roles WHERE code='administrator'").fetchone()[0]
         connection.execute(
             "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) SELECT ?,id,? FROM permissions",
             (administrator, now),
+        )
+        security_officer = connection.execute("SELECT id FROM roles WHERE code='security_officer'").fetchone()[0]
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) "
+            "SELECT ?,id,? FROM permissions WHERE code IN ('unlock.request','unlock.approve','unlock.read')",
+            (security_officer, now),
+        )
+        clerk = connection.execute("SELECT id FROM roles WHERE code='clerk'").fetchone()[0]
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) "
+            "SELECT ?,id,? FROM permissions WHERE code='unlock.request'",
+            (clerk, now),
+        )
+        auditor = connection.execute("SELECT id FROM roles WHERE code='auditor'").fetchone()[0]
+        connection.execute(
+            "INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) "
+            "SELECT ?,id,? FROM permissions WHERE code='unlock.read'",
+            (auditor, now),
         )
 
 

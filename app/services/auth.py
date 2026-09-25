@@ -84,16 +84,33 @@ class AuthService:
             "VALUES(?,?,?,?,?,?)",
             (user["id"], token_digest(token), to_storage(now), to_storage(expires_at), to_storage(now), client_label),
         )
+        session_id = int(cursor.lastrowid)
         self.connection.execute(
             "UPDATE users SET failed_login_count=0,locked_until=NULL,status='active',updated_at=? WHERE id=?",
             (to_storage(now), user["id"]),
         )
+        unlock_request = self.connection.execute(
+            "SELECT id FROM unlock_requests WHERE target_user_id=? AND status='approved' "
+            "AND executed_at IS NOT NULL AND first_login_at IS NULL ORDER BY executed_at DESC LIMIT 1",
+            (user["id"],),
+        ).fetchone()
+        correlation_id = None
+        metadata: dict = {"client_label": client_label}
+        if unlock_request is not None:
+            request_id = int(unlock_request["id"])
+            self.connection.execute(
+                "UPDATE unlock_requests SET first_login_at=?,first_login_session_id=? WHERE id=?",
+                (to_storage(now), session_id, request_id),
+            )
+            correlation_id = f"unlock-request:{request_id}"
+            metadata["unlock_request_id"] = request_id
+            metadata["first_login_after_unlock"] = True
         self.audit.record(
-            AuditContext(user["id"], user["display_name"]),
+            AuditContext(user["id"], user["display_name"], correlation_id),
             action="auth.login",
             resource_type="session",
-            resource_id=cursor.lastrowid,
-            metadata={"client_label": client_label},
+            resource_id=session_id,
+            metadata=metadata,
         )
         return token, {"expires_at": to_storage(expires_at), "user": user, "permissions": sorted(self.users.permissions(user["id"]))}
 

@@ -7,6 +7,7 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal, hash_password, normalize_username
 from app.repositories.identity import RoleRepository, SessionRepository, UserRepository
 from app.services.audit import AuditContext, AuditService
+from app.services.unlock import UnlockRequestService
 
 
 class IdentityService:
@@ -73,6 +74,8 @@ class IdentityService:
             before=before,
             after=after,
         )
+        if before["status"] != after["status"]:
+            self._terminate_lapsed_unlock_requests(principal)
         return self.detail(user_id)
 
     def assign_roles(self, principal: Principal, user_id: int, role_codes: list[str]) -> dict:
@@ -97,6 +100,7 @@ class IdentityService:
             after={"roles": after},
             metadata={"target": user["username"]},
         )
+        self._terminate_lapsed_unlock_requests(principal)
         return self.detail(user_id)
 
     def detail(self, user_id: int) -> dict:
@@ -161,6 +165,8 @@ class IdentityService:
             after=after,
             metadata={"system_role": bool(role["is_system"])},
         )
+        if data.get("permission_codes") is not None:
+            self._terminate_lapsed_unlock_requests(principal)
         return after
 
     def role_detail(self, role_id: int) -> dict:
@@ -176,6 +182,11 @@ class IdentityService:
                 raise NotFoundError(f"角色不存在：{code}")
             roles.append(role)
         return roles
+
+    def _terminate_lapsed_unlock_requests(self, principal: Principal) -> None:
+        UnlockRequestService(self.connection, self.clock).terminate_lapsed(
+            AuditContext(principal.user_id, principal.display_name)
+        )
 
     def _resolve_permissions(self, codes: list[str]) -> list[int]:
         result: list[int] = []

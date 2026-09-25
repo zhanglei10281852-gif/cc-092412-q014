@@ -71,3 +71,15 @@ class DepartmentMembershipCreate(BaseModel):
     is_primary: bool = False
     starts_at: str
     ends_at: str | None = None
+
+
+class UnlockRequestCreate(BaseModel):
+    target_username: str = Field(min_length=3, max_length=64)
+    reason: str = Field(min_length=1, max_length=500)
+    valid_minutes: int = Field(default=60, ge=1, le=1440)
+    session_scope: Literal["all", "pre_lock", "none"] = "all"
+
+
+class UnlockDecision(BaseModel):
+    decision: Literal["approve", "reject"]
+    note: str | None = Field(default=None, max_length=500)
